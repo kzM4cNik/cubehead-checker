@@ -930,6 +930,29 @@ if ($rows.Count -eq 0) { $json = "[]" } else { $json = ConvertTo-Json -InputObje
     return rows
 
 
+def _ycheck_status_line(main):
+    import ctypes
+    from ctypes import wintypes
+
+    user32, text, number = _win_api()
+    found = []
+
+    @ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+    def enum_child(hwnd, _lparam):
+        length = number(hwnd, 0x000E, 0, 0)
+        if not (0 < length < 240):
+            return True
+        buf = ctypes.create_unicode_buffer(length + 1)
+        text(hwnd, 0x000D, length + 1, ctypes.cast(buf, ctypes.c_wchar_p))
+        value = buf.value.strip()
+        if value.startswith("Байткод") or value.startswith("Анализ байткода"):
+            found.append(value)
+        return True
+
+    user32.EnumChildWindows(main, enum_child, 0)
+    return found[-1] if found else ""
+
+
 def ycheck_scan(folder, pc, stop, on_tick=None):
     import time
 
@@ -955,20 +978,21 @@ def ycheck_scan(folder, pc, stop, on_tick=None):
             _YCHECK["proc"] = None
             return []
         summary = _hwnd_text(controls["rich"])
-        line = ""
-        for part in reversed(summary.splitlines()):
-            if part.strip():
-                line = part.strip()
-                break
+        line = _ycheck_status_line(hwnd)
+        if not line:
+            for part in reversed(summary.splitlines()):
+                if part.strip():
+                    line = part.strip()
+                    break
         if summary != previous:
             started = True
         if line and line != last and on_tick:
-            on_tick(line[:180])
+            on_tick(line[:220])
             last = line
         if started and "Done:" in summary:
             break
         _hide_ycheck_windows(proc.pid)
-        time.sleep(0.4)
+        time.sleep(0.25)
     else:
         raise RuntimeError("Y-check не закончил проверку за 20 минут")
     _hide_ycheck_windows(proc.pid)
@@ -1437,6 +1461,10 @@ def launch_gui():
     pc_row = tk.Frame(mods_page, bg=BG)
     pc_row.pack(fill="x", pady=(0, 10))
     pc_btn = flat_button(pc_row, "Scan PC", lambda: scan_pc())
+    progress_label = tk.Label(pc_row, text="", bg=BG, fg=PINK, font=(FONT, 16, "bold"))
+    progress_label.pack(side="left", padx=(16, 0))
+    progress_caption = tk.Label(pc_row, text="", bg=BG, fg=MUTED, font=(FONT, 9))
+    progress_caption.pack(side="left", padx=(8, 0))
 
     result = tk.Frame(mods_page, bg=CARD, highlightbackground=EDGE, highlightthickness=1)
     result.pack(fill="both", expand=True)
@@ -1469,8 +1497,11 @@ def launch_gui():
         justify="center",
     )
     empty.place(relx=0.5, rely=0.5, anchor="center")
+    empty_hint = empty.cget("text")
     if not ycheck_exe():
-        empty.configure(text="Укажи папку с модами и нажми Scan\nили Scan PC, чтобы пройтись по всем дискам")
+        empty_hint = "Укажи папку с модами и нажми Scan\nили Scan PC, чтобы пройтись по всем дискам"
+        empty.configure(text=empty_hint)
+    progress_state = {"cur": 0, "total": 0}
 
     byte_bar = tk.Frame(bytes_page, bg=BG)
     byte_bar.pack(fill="x", pady=(12, 8))
@@ -1602,11 +1633,14 @@ def launch_gui():
 
     def paint_results():
         if not rows:
+            if not progress_state["total"]:
+                empty.configure(text=empty_hint, fg=MUTED, font=(FONT, 11))
             empty.place(relx=0.5, rely=0.5, anchor="center")
             set_text(result_text, "")
             refresh_stats()
             return
         empty.place_forget()
+        empty.configure(text=empty_hint, fg=MUTED, font=(FONT, 11))
         shown = visible_rows()
         tags = []
         clipped = False
@@ -1698,6 +1732,12 @@ def launch_gui():
         stop.clear()
         set_busy(True)
         engine = ycheck_exe()
+        progress_state["cur"] = 0
+        progress_state["total"] = 0
+        progress_label.configure(text="")
+        progress_caption.configure(text="")
+        empty.configure(text="0 / …\nпроверено", fg=PINK, font=(FONT, 28, "bold"))
+        empty.place(relx=0.5, rely=0.5, anchor="center")
         status.configure(text="Y-check проверяет…" if engine else "Сканирую…")
         root.lift()
 
@@ -1813,9 +1853,33 @@ def launch_gui():
                     rows.append(payload)
                     dirty = True
                 elif kind == "tick":
-                    status.configure(text=payload)
+                    text = str(payload)
+                    match = re.search(r"(\d+)\s*/\s*(\d+)", text)
+                    found = re.search(r"Found\s+(\d+)", text, re.I)
+                    mods = re.search(r"(\d+)\s*мод", text, re.I)
+                    name = ""
+                    if match:
+                        progress_state["cur"] = int(match.group(1))
+                        progress_state["total"] = int(match.group(2))
+                        name = text[match.end():].strip(" :-")
+                    elif mods:
+                        progress_state["total"] = int(mods.group(1))
+                    elif found:
+                        progress_state["total"] = int(found.group(1))
+                    else:
+                        status.configure(text=text)
+                    if progress_state["total"]:
+                        cur = progress_state["cur"]
+                        total = progress_state["total"]
+                        progress_label.configure(text=f"{cur}/{total}")
+                        progress_caption.configure(text="проверено")
+                        empty.configure(text=f"{cur} / {total}\nпроверено", fg=PINK, font=(FONT, 28, "bold"))
+                        if not rows:
+                            empty.place(relx=0.5, rely=0.5, anchor="center")
+                        status.configure(text=name or f"Проверено {cur} из {total}")
                 elif kind == "done":
-                    status.configure(text=payload)
+                    count = progress_label.cget("text")
+                    status.configure(text=f"{payload}  {count}".strip())
                     set_busy(False)
                     dirty = True
                     if str(payload).startswith("Готово"):
