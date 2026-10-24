@@ -1,4 +1,6 @@
-# CubeHead Checker — local Minecraft .jar scan. Nothing leaves this PC.
+# CubeHead Checker — local Minecraft jar scan.
+# Official files are confirmed by sending only a SHA1 to Modrinth.
+import hashlib
 import io
 import json
 import math
@@ -8,6 +10,8 @@ import re
 import struct
 import sys
 import threading
+import urllib.error
+import urllib.request
 import zipfile
 from datetime import datetime
 from pathlib import Path
@@ -38,7 +42,7 @@ CHEAT_CLIENTS = {
     "forgehax",
 }
 
-VERIFIED_WORDS = [
+VERIFIED_IDS = {
     "sodium",
     "iris",
     "lithium",
@@ -47,22 +51,27 @@ VERIFIED_WORDS = [
     "ferritecore",
     "modmenu",
     "cloth-config",
+    "cloth_config",
     "fabric-api",
+    "fabric_api",
     "optifine",
     "jei",
     "roughlyenoughitems",
     "appleskin",
     "lambdynamiclights",
+    "lambdynlights",
     "continuity",
     "entityculling",
     "krypton",
     "modernfix",
     "geckolib",
     "architectury",
+    "architectury-api",
     "yacl",
+    "yet_another_config_lib_v3",
     "puzzleslib",
     "fabric-language-kotlin",
-]
+}
 
 
 def app_dir():
@@ -199,7 +208,7 @@ def iter_jars(roots, stop):
             return
         if not root.exists():
             continue
-        if root.is_file() and root.suffix.lower() in {".jar", ".exe"}:
+        if root.is_file() and root.suffix.lower() in {".jar", ".zip"}:
             yield root
             continue
         for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
@@ -207,22 +216,34 @@ def iter_jars(roots, stop):
                 return
             dirnames[:] = [d for d in dirnames if not _skip_dir(d)]
             for name in filenames:
-                if name.lower().endswith(".jar"):
+                if name.lower().endswith((".jar", ".zip")):
                     yield Path(dirpath) / name
 
 
-def _read_meta(zf, names):
-    wanted = (
-        "fabric.mod.json",
-        "quilt.mod.json",
-        "META-INF/mods.toml",
-        "mcmod.info",
-    )
-    chunks = []
-    picked = 0
+def _entry_paths(names):
+    return [n.lower().replace("\\", "/") for n in names]
+
+
+def _path_has(paths, needle):
+    needle = needle.lower().replace("\\", "/").strip("/")
+    if not needle:
+        return False
+    if "/" in needle:
+        return any(needle in path for path in paths)
+    for path in paths:
+        if needle in path.split("/"):
+            return True
+    return False
+
+
+def _read_mod_info(zf, names):
+    mod_id = ""
+    mod_name = ""
+    wanted = {"fabric.mod.json", "quilt.mod.json", "mods.toml", "mcmod.info"}
     for name in names:
         low = name.lower().replace("\\", "/")
-        if not any(low == w or low.endswith("/" + w) for w in wanted):
+        base = low.rsplit("/", 1)[-1]
+        if base not in wanted and not low.endswith(tuple("/" + item for item in wanted)):
             continue
         try:
             info = zf.getinfo(name)
@@ -231,155 +252,165 @@ def _read_meta(zf, names):
         if info.file_size > 262144:
             continue
         try:
-            raw = zf.read(name)
+            text = zf.read(name)[:262144].decode("utf-8", "replace")
         except Exception:
             continue
-        chunks.append(raw[:262144].decode("utf-8", "replace"))
-        picked += 1
-        if picked >= 6:
+        if base.endswith(".json") or base == "mcmod.info":
+            try:
+                data = json.loads(text)
+            except Exception:
+                data = None
+            if isinstance(data, list) and data:
+                data = data[0]
+            if isinstance(data, dict):
+                mod_id = str(data.get("id") or data.get("modid") or mod_id)
+                mod_name = str(data.get("name") or mod_name)
+        else:
+            found_id = re.search(r'(?im)^\s*modid\s*=\s*"([^"]+)"', text)
+            found_name = re.search(r'(?im)^\s*displayname\s*=\s*"([^"]+)"', text)
+            if found_id:
+                mod_id = found_id.group(1)
+            if found_name:
+                mod_name = found_name.group(1)
+        if mod_id and mod_name:
             break
-    return "\n".join(chunks).lower()
+    return mod_id.lower().strip(), mod_name.strip()
 
 
-BYTE_MARKS = (
-    ("Wurst", "cheat", b"net/wurstclient"),
-    ("Wurst", "cheat", b"wurstclient"),
-    ("Meteor Client", "cheat", b"meteordevelopment/meteorclient"),
-    ("Meteor Client", "cheat", b"meteorclient"),
-    ("LiquidBounce", "cheat", b"net/ccbluex/liquidbounce"),
-    ("LiquidBounce", "cheat", b"liquidbounce"),
-    ("BleachHack", "cheat", b"bleachhack"),
-    ("Aristois", "cheat", b"aristois"),
-    ("Impact", "cheat", b"impactclient"),
-    ("Sigma", "cheat", b"sigmaclient"),
-    ("RusherHack", "cheat", b"rusherhack"),
-    ("Future", "cheat", b"futureclient"),
-    ("Kami", "cheat", b"kamiblue"),
-    ("Phobos", "cheat", b"me/earth/phobos"),
-    ("Novoline", "cheat", b"novoline"),
-    ("Astolfo", "cheat", b"astolfo"),
-    ("Tenacity", "cheat", b"tenacityclient"),
-    ("Rise", "cheat", b"riseclient"),
-    ("Doomsday", "cheat", b"doomsdayclient"),
-    ("ForgeHax", "cheat", b"forgehax"),
-    ("Baritone", "blocked", b"baritone/api"),
-    ("Tweakeroo", "blocked", b"fi/dy/masa/tweakeroo"),
-    ("Replay Mod", "blocked", b"com/replaymod"),
-    ("SeedCracker", "blocked", b"seedcracker"),
-    ("FreeCam", "blocked", b"freecam"),
-    ("Inventory Profiles Next", "blocked", b"inventoryprofilesnext"),
-    ("World Downloader", "blocked", b"net/minecraft/wdl"),
-    ("Better PVP", "blocked", b"betterpvp"),
-    ("ClientCommands", "blocked", b"clientcommands"),
-    ("Chest Locator", "blocked", b"chestlocator"),
-    ("Wall-Jump", "blocked", b"walljump"),
-    ("Auto Clicker", "blocked", b"autoclicker"),
-    ("Elytra Utilities", "blocked", b"elytrautilities"),
-    ("Squake", "blocked", b"squake"),
-    ("Bedrock Miner", "blocked", b"bedrockminer"),
-    ("FindMe", "blocked", b"findme"),
-)
-
-
-def _scan_bytes(zf, names):
+def _nested_paths(zf, names, depth=0):
     found = []
-    seen = set()
-    budget = 8_000_000
-    used = 0
-    pending = list(BYTE_MARKS)
-    files = [n for n in names if n.lower().endswith((".class", ".json", ".toml", ".txt", ".xml"))]
-    nested = [n for n in names if n.lower().endswith(".jar")][:4]
-    for name in files:
-        if not pending or used >= budget:
+    if depth >= 2:
+        return found
+    seen = 0
+    for name in names:
+        if seen >= 4:
             break
+        if not name.lower().endswith(".jar"):
+            continue
         try:
             info = zf.getinfo(name)
         except KeyError:
             continue
-        if info.file_size <= 0 or info.file_size > 1_800_000:
+        if info.file_size <= 0 or info.file_size > 30_000_000:
             continue
         try:
-            raw = zf.read(name).lower()
+            inner = zipfile.ZipFile(io.BytesIO(zf.read(name)))
         except Exception:
             continue
-        used += len(raw)
-        still = []
-        for item in pending:
-            if item[2] in raw:
-                if item[0] not in seen:
-                    found.append({"name": item[0], "level": item[1]})
-                    seen.add(item[0])
-            else:
-                still.append(item)
-        pending = still
-    for name in nested:
-        if used >= budget:
-            break
-        try:
-            raw = zf.read(name)
-        except Exception:
-            continue
-        used += len(raw)
-        try:
-            inner = zipfile.ZipFile(io.BytesIO(raw))
-        except Exception:
-            continue
-        blob = "\n".join(inner.namelist()).lower().encode("latin1", "ignore")
-        for item in list(pending):
-            if item[2] in blob and item[0] not in seen:
-                found.append({"name": item[0], "level": item[1]})
-                seen.add(item[0])
+        seen += 1
+        inner_names = inner.namelist()[:8000]
+        found.extend(_entry_paths(inner_names))
+        found.extend(_nested_paths(inner, inner_names, depth + 1))
     return found
 
 
-def inspect_exe(path, rules):
-    try:
-        mtime = datetime.fromtimestamp(path.stat().st_mtime).strftime("%Y-%m-%d %H:%M")
-        size = path.stat().st_size
-    except OSError as exc:
-        return {"path": str(path), "file": path.name, "status": "error", "hits": [], "detail": str(exc), "mtime": "", "size": 0}
-    blob = path.name.lower().encode("latin1", "ignore")
-    try:
-        with open(path, "rb") as fh:
-            blob += fh.read(8_000_000).lower()
-    except OSError:
-        pass
+def _match_rules(rules, filename, stem, mod_id, paths):
     hits = []
     seen = set()
-    for name, level, mark in BYTE_MARKS:
-        if mark in blob and name not in seen:
-            hits.append({"name": name, "level": level})
-            seen.add(name)
     for rule in rules:
         if rule["name"] in seen:
             continue
-        for needle in rule["file"] + rule["path"]:
-            if needle and needle.encode("latin1", "ignore") in blob:
-                hits.append({"name": rule["name"], "level": rule["level"]})
-                seen.add(rule["name"])
+        matched = False
+        for needle in rule["file"]:
+            if needle and (needle in filename or needle in stem):
+                matched = True
                 break
-    levels = {h["level"] for h in hits}
-    if "cheat" in levels:
-        status = "cheat"
-    elif "blocked" in levels:
-        status = "blocked"
-    else:
-        status = "unknown"
+        if not matched and mod_id:
+            for needle in rule["id"]:
+                if needle and mod_id == needle:
+                    matched = True
+                    break
+        if not matched:
+            for needle in rule["path"]:
+                if needle and _path_has(paths, needle):
+                    matched = True
+                    break
+        if matched:
+            hits.append({"name": rule["name"], "level": rule["level"]})
+            seen.add(rule["name"])
+    return hits
+
+
+_MODRINTH = {"map": None, "writes": 0, "lock": threading.Lock()}
+
+
+def _modrinth_cache_path():
+    folder = Path(os.environ.get("LOCALAPPDATA", str(Path.home()))) / "cubehead-checker"
+    folder.mkdir(parents=True, exist_ok=True)
+    return folder / "modrinth-cache.json"
+
+
+def _modrinth_cache():
+    if _MODRINTH["map"] is None:
+        try:
+            _MODRINTH["map"] = json.loads(_modrinth_cache_path().read_text(encoding="utf-8"))
+        except Exception:
+            _MODRINTH["map"] = {}
+    return _MODRINTH["map"]
+
+
+def _file_sha1(path):
+    digest = hashlib.sha1()
+    with open(path, "rb") as handle:
+        while True:
+            chunk = handle.read(1024 * 1024)
+            if not chunk:
+                break
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def lookup_modrinth(sha1):
+    cache = _modrinth_cache()
+    with _MODRINTH["lock"]:
+        cached = cache.get(sha1)
+    if isinstance(cached, dict) and "known" in cached:
+        return cached
+    found = {"known": False, "name": ""}
+    try:
+        req = urllib.request.Request(
+            f"https://api.modrinth.com/v2/version_file/{sha1}?algorithm=sha1",
+            headers={"User-Agent": "CubeHeadChecker/1.1", "Accept": "application/json"},
+        )
+        with urllib.request.urlopen(req, timeout=4) as resp:
+            data = json.loads(resp.read().decode("utf-8", "replace"))
+        found = {"known": True, "name": str(data.get("name") or data.get("version_number") or "Modrinth")}
+    except urllib.error.HTTPError as exc:
+        if exc.code != 404:
+            return None
+    except Exception:
+        return None
+    with _MODRINTH["lock"]:
+        cache[sha1] = found
+        _MODRINTH["writes"] += 1
+        if _MODRINTH["writes"] % 20 == 1:
+            try:
+                _modrinth_cache_path().write_text(json.dumps(cache), encoding="utf-8")
+            except OSError:
+                pass
+    return found
+
+
+def _row(path, status, hits, detail, mtime, size, mod_name=""):
     return {
         "path": str(path),
         "file": path.name,
         "status": status,
         "hits": hits,
-        "detail": ", ".join(dict.fromkeys(h["name"] for h in hits)) or "программа",
+        "detail": detail,
         "mtime": mtime,
         "size": size,
+        "mod_name": mod_name,
     }
 
 
-def inspect_any(path, rules):
-    if str(path).lower().endswith(".exe"):
-        return inspect_exe(path, rules)
-    return inspect_jar(path, rules)
+def _level(hits):
+    levels = {hit["level"] for hit in hits}
+    if "cheat" in levels:
+        return "cheat"
+    if "blocked" in levels:
+        return "blocked"
+    return ""
 
 
 def inspect_jar(path, rules):
@@ -389,98 +420,49 @@ def inspect_jar(path, rules):
         mtime = datetime.fromtimestamp(path.stat().st_mtime).strftime("%Y-%m-%d %H:%M")
         size = path.stat().st_size
     except OSError as exc:
-        return {
-            "path": str(path),
-            "file": path.name,
-            "status": "error",
-            "hits": [],
-            "detail": str(exc),
-            "mtime": "",
-            "size": 0,
-        }
+        return _row(path, "unknown", [], str(exc), "", 0)
 
-    hits = []
+    if path.suffix.lower() not in {".jar", ".zip"}:
+        return _row(path, "unknown", [], "", mtime, size)
+
     try:
         with zipfile.ZipFile(path) as zf:
             names = zf.namelist()
             if len(names) > 12000:
                 names = names[:12000]
-            entry_blob = "\n".join(n.lower().replace("\\", "/") for n in names)
-            meta = _read_meta(zf, names) or ""
-            byte_hits = _scan_bytes(zf, names) or []
+            mod_id, mod_name = _read_mod_info(zf, names)
+            paths = _entry_paths(names)
+            paths.extend(_nested_paths(zf, names))
     except zipfile.BadZipFile:
-        return {
-            "path": str(path),
-            "file": path.name,
-            "status": "error",
-            "hits": [],
-            "detail": "не jar / битый архив",
-            "mtime": mtime,
-            "size": size,
-        }
-    except Exception as exc:
-        return {
-            "path": str(path),
-            "file": path.name,
-            "status": "error",
-            "hits": [],
-            "detail": str(exc),
-            "mtime": mtime,
-            "size": size,
-        }
+        return _row(path, "unknown", [], "", mtime, size)
+    except Exception:
+        return _row(path, "unknown", [], "", mtime, size)
 
-    for rule in rules:
-        matched = False
-        for needle in rule["file"]:
-            if needle and (needle in filename or needle in stem):
-                matched = True
-                break
-        if not matched:
-            for needle in rule["id"]:
-                if needle and re.search(
-                    r"(?<![a-z0-9])" + re.escape(needle) + r"(?![a-z0-9])",
-                    meta,
-                ):
-                    matched = True
-                    break
-        if not matched:
-            for needle in rule["path"]:
-                if needle and (needle in entry_blob or needle in meta or needle in filename):
-                    matched = True
-                    break
-        if matched:
-            hits.append({"name": rule["name"], "level": rule["level"]})
+    hits = _match_rules(rules, filename, stem, mod_id, paths)
+    level = _level(hits)
+    if level:
+        return _row(path, level, hits, ", ".join(dict.fromkeys(hit["name"] for hit in hits)), mtime, size, mod_name)
 
-    for extra in byte_hits:
-        if extra["name"] not in {h["name"] for h in hits}:
-            hits.append(extra)
-
-    levels = {h["level"] for h in hits}
-    if "cheat" in levels:
-        status = "cheat"
-    elif "blocked" in levels:
-        status = "blocked"
-    elif _is_verified(filename, stem, meta):
-        status = "verified"
-    else:
-        status = "unknown"
-    return {
-        "path": str(path),
-        "file": path.name,
-        "status": status,
-        "hits": hits,
-        "detail": ", ".join(dict.fromkeys(h["name"] for h in hits)),
-        "mtime": mtime,
-        "size": size,
-    }
+    detail = mod_name
+    status = "unknown"
+    if mod_id:
+        try:
+            remote = lookup_modrinth(_file_sha1(path))
+        except OSError:
+            remote = None
+        if remote and remote.get("known"):
+            status = "verified"
+            detail = remote.get("name") or mod_name or mod_id
+        elif remote is None and mod_id in VERIFIED_IDS:
+            status = "verified"
+            detail = mod_name or mod_id
+        elif mod_name:
+            detail = mod_name
+    return _row(path, status, hits, detail, mtime, size, mod_name)
 
 
-def _is_verified(filename, stem, meta):
-    blob = filename + "\n" + stem + "\n" + meta
-    for word in VERIFIED_WORDS:
-        if re.search(r"(?<![a-z0-9])" + re.escape(word) + r"(?![a-z0-9])", blob):
-            return True
-    return False
+def inspect_any(path, rules):
+    return inspect_jar(path, rules)
 
 
 def class_names(path, limit=2500):
@@ -564,7 +546,7 @@ def loaded_log_text():
 def scan(roots, rules, stop, on_jar=None, on_tick=None):
     results = []
     seen = set()
-    walked = 0
+    paths = []
     for jar in iter_jars(roots, stop):
         if stop.is_set():
             break
@@ -575,13 +557,25 @@ def scan(roots, rules, stop, on_jar=None, on_tick=None):
         if key in seen:
             continue
         seen.add(key)
-        walked += 1
-        if on_tick and walked % 25 == 0:
-            on_tick(walked, jar)
+        paths.append(jar)
+        if on_tick and len(paths) % 20 == 0:
+            on_tick(-1, len(paths), jar)
+    total = len(paths)
+    for index, jar in enumerate(paths, 1):
+        if stop.is_set():
+            break
         row = inspect_any(jar, rules)
         results.append(row)
+        if on_tick:
+            on_tick(index, total, jar)
         if on_jar:
-            on_jar(row, walked)
+            on_jar(row, index, total)
+    try:
+        cache = _MODRINTH.get("map")
+        if cache:
+            _modrinth_cache_path().write_text(json.dumps(cache), encoding="utf-8")
+    except OSError:
+        pass
     return results
 
 
@@ -632,6 +626,7 @@ _WIN = {}
 
 
 def ycheck_exe():
+    return None
     names = ("Y-check.exe", "Y-Check.exe", "y-check.exe")
     folders = (
         Path(r"C:\Users\TRXPC\Downloads"),
@@ -1060,17 +1055,20 @@ def launch_gui():
     import tkinter as tk
     from tkinter import filedialog, messagebox
 
-    BG = "#241c2c"
-    PANEL = "#2c2236"
-    CARD = "#32283b"
-    EDGE = "#4a3d55"
-    TEXT = "#f7f1f6"
-    MUTED = "#b5a7b8"
-    PINK = "#e3b4c8"
-    PINK_BTN = "#d7a4bb"
-    GREEN = "#8ed48f"
-    CHEAT_C = "#e7a4ae"
-    BLOCK_C = "#b7a6ea"
+    BG = "#160d14"
+    PANEL = "#24141c"
+    CARD = "#2c1822"
+    EDGE = "#6e3c50"
+    TEXT = "#fff7f8"
+    MUTED = "#d7b4c2"
+    PINK = "#ffb7c5"
+    PINK_BTN = "#f4a8bc"
+    GREEN = "#b7e4c7"
+    CHEAT_C = "#ff8fa3"
+    BLOCK_C = "#e4c1f9"
+    INK = "#3b1c28"
+    FIELD = "#120910"
+    SOFT = "#4a2834"
     FONT = "Segoe UI"
 
     rules = load_rules()
@@ -1115,7 +1113,8 @@ def launch_gui():
                 pass
 
     root.after(10, taskbar)
-    root.after(80, lambda: (root.withdraw(), root.after(40, root.deiconify), root.after(60, taskbar)))
+    if not os.environ.get("CH_SHOT"):
+        root.after(80, lambda: (root.withdraw(), root.after(40, root.deiconify), root.after(60, taskbar)))
 
     drag = {"x": 0, "y": 0}
 
@@ -1160,8 +1159,24 @@ def launch_gui():
 
     logo = tk.Canvas(top, width=36, height=36, bg=BG, highlightthickness=0)
     logo.pack(side="left", padx=(16, 10), pady=11)
-    logo.create_oval(1, 1, 35, 35, fill=PINK, outline="")
-    logo.create_text(18, 18, text="C", fill="#3a2433", font=(FONT, 16, "bold"))
+
+    def paint_flower(canvas, x, y, radius, color, tag=""):
+        for step in range(5):
+            angle = math.radians(-90 + step * 72)
+            cx = x + math.cos(angle) * radius * 0.55
+            cy = y + math.sin(angle) * radius * 0.55
+            canvas.create_oval(
+                cx - radius * 0.46,
+                cy - radius * 0.32,
+                cx + radius * 0.46,
+                cy + radius * 0.32,
+                fill=color,
+                outline="",
+                tags=tag,
+            )
+        canvas.create_oval(x - 3, y - 3, x + 3, y + 3, fill="#fff6ea", outline="", tags=tag)
+
+    paint_flower(logo, 18, 18, 11, PINK)
     logo.bind("<Button-1>", start_drag)
     logo.bind("<B1-Motion>", on_drag)
 
@@ -1171,15 +1186,15 @@ def launch_gui():
     namebox.bind("<B1-Motion>", on_drag)
     title = tk.Label(namebox, text="CubeHead", bg=BG, fg=TEXT, font=(FONT, 14, "bold"))
     title.pack(anchor="w")
-    subtitle = tk.Label(namebox, text="MOD ANALYZER", bg=BG, fg=MUTED, font=(FONT, 8))
+    subtitle = tk.Label(namebox, text="SAKURA  ·  MOD ANALYZER", bg=BG, fg=PINK, font=(FONT, 8))
     subtitle.pack(anchor="w")
     title.bind("<Button-1>", start_drag)
     title.bind("<B1-Motion>", on_drag)
     subtitle.bind("<Button-1>", start_drag)
     subtitle.bind("<B1-Motion>", on_drag)
 
-    def win_btn(text, command, hover="#3a3144"):
-        b = tk.Label(top, text=text, bg="#32283b", fg=TEXT, font=(FONT, 11), width=3, padx=4, pady=2, cursor="hand2")
+    def win_btn(text, command, hover="#5a3044"):
+        b = tk.Label(top, text=text, bg=CARD, fg=TEXT, font=(FONT, 11), width=3, padx=4, pady=2, cursor="hand2")
         b.pack(side="right", padx=(0, 8), pady=14)
         def press(_e):
             play_tone(500, 24)
@@ -1187,12 +1202,52 @@ def launch_gui():
 
         b.bind("<Button-1>", press)
         b.bind("<Enter>", lambda _e: b.configure(bg=hover))
-        b.bind("<Leave>", lambda _e: b.configure(bg="#32283b"))
+        b.bind("<Leave>", lambda _e: b.configure(bg=CARD))
         return b
 
-    win_btn("✕", root.destroy, "#8a3d4a")
+    win_btn("✕", root.destroy, "#a84860")
     win_btn("▢", toggle_max)
     win_btn("—", minimize)
+
+    import random
+
+    sky = tk.Canvas(top, bg=BG, highlightthickness=0, bd=0)
+    sky.place(x=0, y=0, relwidth=1, relheight=1)
+    root.tk.call("lower", str(sky))
+    header_petals = []
+    petal_rng = random.Random(11)
+    for _ in range(12):
+        header_petals.append(
+            {
+                "x": petal_rng.uniform(0, 1100),
+                "y": petal_rng.uniform(0, 58),
+                "s": petal_rng.uniform(7, 13),
+                "v": petal_rng.uniform(0.25, 0.7),
+                "drift": petal_rng.uniform(-0.35, 0.35),
+                "color": petal_rng.choice(("#ffb7c5", "#f7c6d4", "#ffe4ec", "#e7a4c4")),
+            }
+        )
+
+    def drift_header():
+        try:
+            sky.delete("petal")
+        except tk.TclError:
+            return
+        width = max(top.winfo_width(), 400)
+        for petal in header_petals:
+            petal["x"] += petal["drift"]
+            petal["y"] += petal["v"] * 0.35
+            if petal["x"] < -20:
+                petal["x"] = width
+            if petal["x"] > width + 20:
+                petal["x"] = 0
+            if petal["y"] > 70:
+                petal["y"] = -8
+                petal["x"] = petal_rng.uniform(0, width)
+            paint_flower(sky, petal["x"], petal["y"], petal["s"] * 0.45, petal["color"], "petal")
+        root.after(80, drift_header)
+
+    root.after(80, drift_header)
 
     view = {"sort": "status", "loaded_only": False, "menu": None}
 
@@ -1209,7 +1264,7 @@ def launch_gui():
         row = tk.Label(
             parent,
             text=(text + "    ›") if arrow else text,
-            bg="#2a2233",
+            bg="#2a1622",
             fg=TEXT,
             anchor="w",
             font=(FONT, 10),
@@ -1220,15 +1275,15 @@ def launch_gui():
         row.pack(fill="x")
 
         def enter(_e):
-            row.configure(bg="#3a3144")
+            row.configure(bg="#5a3044")
 
         def leave(_e):
-            row.configure(bg="#2a2233")
+            row.configure(bg="#2a1622")
 
         def press(_e):
-            row.configure(bg=PINK_BTN, fg="#3a2433")
+            row.configure(bg=PINK_BTN, fg=INK)
             play_tone(640, 30)
-            root.after(70, lambda: (row.configure(bg="#3a3144", fg=TEXT), command()))
+            root.after(70, lambda: (row.configure(bg="#5a3044", fg=TEXT), command()))
 
         row.bind("<Enter>", enter)
         row.bind("<Leave>", leave)
@@ -1269,7 +1324,7 @@ def launch_gui():
     def open_settings(anchor=None):
         close_menu()
         play_tone(600, 28)
-        menu = tk.Frame(root, bg="#2a2233", highlightbackground=EDGE, highlightthickness=1)
+        menu = tk.Frame(root, bg="#2a1622", highlightbackground=EDGE, highlightthickness=1)
         view["menu"] = menu
         menu_item(menu, "Только загруженные в игру моды", toggle_loaded)
         menu_item(menu, "Save — Рабочий стол", save_desktop)
@@ -1282,7 +1337,7 @@ def launch_gui():
 
     def open_sort(parent):
         play_tone(600, 28)
-        sub = tk.Frame(root, bg="#2a2233", highlightbackground=EDGE, highlightthickness=1)
+        sub = tk.Frame(root, bg="#2a1622", highlightbackground=EDGE, highlightthickness=1)
         view["sort_menu"] = sub
 
         def pick(mode):
@@ -1384,7 +1439,7 @@ def launch_gui():
     entry = tk.Entry(
         path_row,
         textvariable=path_var,
-        bg="#1b1522",
+        bg=FIELD,
         fg=TEXT,
         insertbackground=TEXT,
         relief="flat",
@@ -1405,14 +1460,14 @@ def launch_gui():
         if not entry.get().strip():
             entry.delete(0, "end")
             entry.insert(0, PLACEHOLDER)
-            entry.configure(fg="#7d7084")
+            entry.configure(fg="#b08a9a")
 
     entry.insert(0, PLACEHOLDER)
-    entry.configure(fg="#7d7084")
+    entry.configure(fg="#b08a9a")
     entry.bind("<FocusIn>", focus_in)
     entry.bind("<FocusOut>", focus_out)
 
-    def flat_button(parent, text, command, fill=PINK_BTN, fg="#3a2433", pad=(14, 7)):
+    def flat_button(parent, text, command, fill=PINK_BTN, fg=INK, pad=(14, 7)):
         width = max(86, 12 * len(text) + 28)
         height = 34
         c = tk.Canvas(parent, width=width, height=height, bg=BG, highlightthickness=0, cursor="hand2")
@@ -1434,12 +1489,12 @@ def launch_gui():
         draw(fill)
 
         def press(_e=None):
-            draw("#c489a4" if fill == PINK_BTN else "#2a2433")
+            draw("#e090a8" if fill == PINK_BTN else "#3a1824")
             play_tone(700, 32)
             root.after(90, lambda: (draw(fill), command()))
 
         def enter(_e):
-            draw("#efc6d6" if fill == PINK_BTN else "#4a3d55")
+            draw("#ffd0dc" if fill == PINK_BTN else "#6e3c50")
 
         def leave(_e):
             draw(fill)
@@ -1454,8 +1509,10 @@ def launch_gui():
         c.bind("<Leave>", leave)
         return c
 
-    browse_btn = flat_button(path_row, "Browse", lambda: pick_folder(), fill="#3a3146", fg=TEXT)
+    browse_btn = flat_button(path_row, "Browse", lambda: pick_folder(), fill=SOFT, fg=TEXT)
     browse_btn.pack_configure(padx=(0, 8))
+    file_btn = flat_button(path_row, "File", lambda: pick_file(), fill=SOFT, fg=TEXT)
+    file_btn.pack_configure(padx=(0, 8))
     scan_btn = flat_button(path_row, "Scan", lambda: scan_path())
 
     pc_row = tk.Frame(mods_page, bg=BG)
@@ -1488,20 +1545,66 @@ def launch_gui():
     result_text.tag_configure("blocked", foreground=BLOCK_C)
     result_text.tag_configure("error", foreground="#cbb8a2")
     result_text.tag_configure("dim", foreground=MUTED)
-    empty = tk.Label(
-        result,
-        text="Проверку делает Y-check.\nУкажи папку с модами и нажми Scan\nили Scan PC, чтобы пройтись по всем дискам",
-        bg=CARD,
-        fg=MUTED,
-        font=(FONT, 11),
-        justify="center",
-    )
-    empty.place(relx=0.5, rely=0.5, anchor="center")
-    empty_hint = empty.cget("text")
-    if not ycheck_exe():
-        empty_hint = "Укажи папку с модами и нажми Scan\nили Scan PC, чтобы пройтись по всем дискам"
-        empty.configure(text=empty_hint)
+    empty_hint = "Укажи папку с модами и нажми Scan\nили Scan PC по всем дискам\n\nОбычные файлы, не jar, пропускаются"
+    bloom = tk.Canvas(result, bg=CARD, highlightthickness=0, bd=0)
+    bloom_petals = []
+    for _ in range(16):
+        bloom_petals.append(
+            {
+                "x": petal_rng.uniform(40, 700),
+                "y": petal_rng.uniform(20, 420),
+                "s": petal_rng.uniform(8, 16),
+                "v": petal_rng.uniform(0.35, 0.9),
+                "drift": petal_rng.uniform(-0.4, 0.4),
+                "color": petal_rng.choice(("#ffb7c5", "#f7c6d4", "#ffe4ec", "#e7a4c4")),
+            }
+        )
+    bloom_mode = {"big": False, "line": empty_hint}
     progress_state = {"cur": 0, "total": 0}
+
+    def redraw_bloom():
+        if not bloom.winfo_ismapped():
+            return
+        bloom.delete("all")
+        width = max(bloom.winfo_width(), 320)
+        height = max(bloom.winfo_height(), 220)
+        for petal in bloom_petals:
+            paint_flower(bloom, petal["x"], petal["y"], petal["s"] * 0.42, petal["color"])
+        if bloom_mode["big"]:
+            bloom.create_text(width / 2, height / 2 - 12, text=bloom_mode["line"], fill=PINK, font=(FONT, 32, "bold"))
+            bloom.create_text(width / 2, height / 2 + 28, text="проверено", fill=MUTED, font=(FONT, 12))
+        else:
+            bloom.create_text(width / 2, height / 2, text=bloom_mode["line"], fill=MUTED, font=(FONT, 12), justify="center")
+
+    def show_bloom():
+        bloom.place(relx=0, rely=0, relwidth=1, relheight=1)
+        root.tk.call("raise", str(bloom))
+        redraw_bloom()
+
+    def hide_bloom():
+        bloom.place_forget()
+
+    def drift_bloom():
+        width = max(bloom.winfo_width(), 320)
+        height = max(bloom.winfo_height(), 220)
+        for petal in bloom_petals:
+            petal["x"] += petal["drift"]
+            petal["y"] += petal["v"]
+            if petal["y"] > height + 16:
+                petal["y"] = -16
+                petal["x"] = petal_rng.uniform(0, width)
+            if petal["x"] < -16:
+                petal["x"] = width
+            if petal["x"] > width + 16:
+                petal["x"] = 0
+        try:
+            redraw_bloom()
+        except tk.TclError:
+            return
+        root.after(90, drift_bloom)
+
+    show_bloom()
+    root.after(90, drift_bloom)
 
     byte_bar = tk.Frame(bytes_page, bg=BG)
     byte_bar.pack(fill="x", pady=(12, 8))
@@ -1509,17 +1612,20 @@ def launch_gui():
 
     def open_jar_dialog():
         play_tone(640, 28)
-        picked = filedialog.askopenfilename(
-            title="Открыть JAR",
-            parent=root,
-            filetypes=[("JAR", "*.jar"), ("Все файлы", "*.*")],
+        picked = system_dialog(
+            lambda: filedialog.askopenfilename(
+                title="Открыть JAR",
+                parent=root,
+                filetypes=[("JAR", "*.jar"), ("ZIP", "*.zip")],
+            )
         )
         if picked:
+            show_page("bytes")
             load_jar_viewer(picked)
 
-    flat_button(byte_bar, "Open JAR", open_jar_dialog, fill="#3a3146", fg=TEXT)
+    flat_button(byte_bar, "Open JAR", open_jar_dialog, fill=SOFT, fg=TEXT)
     tk.Label(byte_bar, textvariable=byte_file, bg=BG, fg=MUTED, font=(FONT, 10)).pack(side="left", padx=10)
-    tk.Label(byte_bar, text="drop jar anywhere", bg=BG, fg="#7d7084", font=(FONT, 9)).pack(side="right")
+    tk.Label(byte_bar, text="drop jar anywhere", bg=BG, fg="#b08a9a", font=(FONT, 9)).pack(side="right")
 
     panes = tk.Frame(bytes_page, bg=BG)
     panes.pack(fill="both", expand=True)
@@ -1529,9 +1635,9 @@ def launch_gui():
     tk.Label(files_card, text="Files", bg=CARD, fg=TEXT, font=(FONT, 10, "bold")).pack(anchor="w", padx=12, pady=(10, 6))
     file_tree = tk.Listbox(
         files_card,
-        bg="#241c2c",
+        bg=FIELD,
         fg=TEXT,
-        selectbackground="#5a3d52",
+        selectbackground="#6a3048",
         selectforeground=TEXT,
         relief="flat",
         highlightthickness=0,
@@ -1546,7 +1652,7 @@ def launch_gui():
     view_card.pack(side="left", fill="both", expand=True)
     view_title = tk.Label(view_card, text="Viewer    Select a file in the tree", bg=CARD, fg=MUTED, font=(FONT, 10))
     view_title.pack(anchor="w", padx=12, pady=(10, 6))
-    byte_text = tk.Text(view_card, bg="#241c2c", fg="#eadfeb", relief="flat", font=("Consolas", 10), padx=12, pady=10, wrap="none", highlightthickness=0)
+    byte_text = tk.Text(view_card, bg=FIELD, fg="#ffe8ef", relief="flat", font=("Consolas", 10), padx=12, pady=10, wrap="none", highlightthickness=0)
     byte_text.pack(fill="both", expand=True, padx=10, pady=(0, 10))
     byte_text.configure(state="disabled")
     viewer_entries = []
@@ -1557,10 +1663,19 @@ def launch_gui():
         drop_hint.place_forget()
         file_tree.delete(0, "end")
         viewer_entries.clear()
+        if not str(path).lower().endswith((".jar", ".zip")):
+            set_text(byte_text, "Это простой файл.\nПросмотр открывает только .jar")
+            view_title.configure(text="Viewer")
+            return
         try:
             names = jar_entries(path)
-        except Exception as exc:
-            set_text(byte_text, str(exc))
+        except zipfile.BadZipFile:
+            set_text(byte_text, "Файл не открылся как jar.\nПохоже на простой или битый файл.")
+            view_title.configure(text="Viewer")
+            return
+        except Exception:
+            set_text(byte_text, "Файл не открылся.\nНужен обычный .jar")
+            view_title.configure(text="Viewer")
             return
         for name in names:
             viewer_entries.append(name)
@@ -1631,16 +1746,25 @@ def launch_gui():
             shown.sort(key=lambda r: (order_key.get(r["status"], 9), r["file"].lower()))
         return shown
 
+    def human_size(size):
+        size = int(size or 0)
+        if size < 1024:
+            return f"{size} B"
+        if size < 1024 * 1024:
+            return f"{size / 1024:.0f} KB"
+        return f"{size / 1024 / 1024:.1f} MB"
+
     def paint_results():
         if not rows:
-            if not progress_state["total"]:
-                empty.configure(text=empty_hint, fg=MUTED, font=(FONT, 11))
-            empty.place(relx=0.5, rely=0.5, anchor="center")
+            if not bloom_mode["big"] and not progress_state["total"]:
+                bloom_mode["line"] = empty_hint
+            show_bloom()
             set_text(result_text, "")
             refresh_stats()
             return
-        empty.place_forget()
-        empty.configure(text=empty_hint, fg=MUTED, font=(FONT, 11))
+        hide_bloom()
+        bloom_mode["big"] = False
+        bloom_mode["line"] = empty_hint
         shown = visible_rows()
         tags = []
         clipped = False
@@ -1650,33 +1774,35 @@ def launch_gui():
             ][:800]
             clipped = True
         for row in shown:
-            line = f"{STATUS_RU.get(row['status'], row['status']):<10}  {row.get('detail') or '—':<22}  {row['file']}\n"
+            title = row.get("mod_name") or row["file"]
+            line = f"{STATUS_RU.get(row['status'], row['status']):<10}  {row.get('detail') or '—':<28}  {title}\n"
             tags.append((line, row["status"] if row["status"] in STATUS_RU else "unknown"))
-            tags.append((f"{'':<10}  {row['path']}\n", "dim"))
+            tags.append((f"{'':<10}  {row['path']}    {row.get('mtime') or ''}    {human_size(row.get('size'))}\n", "dim"))
         if clipped:
             tags.append(("\nСписок длинный: сверху срабатывания, остальное обрезано.\n", "dim"))
         set_text(result_text, "", tags)
         refresh_stats()
 
     def show_page(name):
-        if page["name"] == name and name == "mods":
+        if page.get("ready") and page["name"] == name and name == "mods":
             return
+        page["ready"] = True
         play_tone(620, 28)
         page["name"] = name
-        subtitle.configure(text="BYTECODE VIEWER" if name == "bytes" else "MOD ANALYZER")
+        subtitle.configure(text="SAKURA  ·  BYTECODE" if name == "bytes" else "SAKURA  ·  MOD ANALYZER")
         for key, btn in tool_btns.items():
             if key == name:
-                btn.configure(bg=PINK_BTN, fg="#3a2433")
+                btn.configure(bg=PINK_BTN, fg=INK)
             else:
                 btn.configure(bg=PANEL, fg=TEXT)
         leaving = bytes_page if name == "mods" else mods_page
         coming = mods_page if name == "mods" else bytes_page
         leaving.pack_forget()
         coming.pack(fill="both", expand=True)
-        coming.configure(bg="#3a2c44")
+        coming.configure(bg="#3a2030")
 
         def settle(step=0):
-            shades = ("#34283c", "#2e2436", BG)
+            shades = ("#321c28", "#24141c", BG)
             if step >= len(shades):
                 return
             try:
@@ -1712,137 +1838,117 @@ def launch_gui():
 
     def set_busy(busy):
         pc_btn.set_text("Stop" if busy else "Scan PC")
+        scan_btn.set_text("Stop" if busy else "Scan")
 
     def begin(roots, pc=False):
         if worker["thread"] and worker["thread"].is_alive():
             stop.set()
             status.configure(text="Останавливаю…")
             return
-        folder = None
-        if not pc:
+        if pc:
+            existing = pc_roots()
+        else:
             existing = [p for p in roots if p.exists()]
             if not existing:
-                messagebox.showinfo("CubeHead", "Папка не найдена.", parent=root)
+                status.configure(text="Такой папки нет.")
                 return
-            folder = existing[0]
-            if folder.is_file():
-                folder = folder.parent
         rows.clear()
-        paint_results()
-        stop.clear()
-        set_busy(True)
-        engine = ycheck_exe()
         progress_state["cur"] = 0
         progress_state["total"] = 0
         progress_label.configure(text="")
         progress_caption.configure(text="")
-        empty.configure(text="0 / …\nпроверено", fg=PINK, font=(FONT, 28, "bold"))
-        empty.place(relx=0.5, rely=0.5, anchor="center")
-        status.configure(text="Y-check проверяет…" if engine else "Сканирую…")
+        bloom_mode["big"] = True
+        bloom_mode["line"] = "0 / …"
+        paint_results()
+        stop.clear()
+        set_busy(True)
+        status.configure(text="Ищу jar…")
         root.lift()
 
-        def work():
-            if engine:
-                try:
-                    found = ycheck_scan(folder, pc, stop, on_tick=lambda msg: events.put(("tick", "Y-check: " + msg)))
-                except Exception as exc:
-                    events.put(("done", f"Ошибка: {exc}"))
-                    return
-                for row in found:
-                    if stop.is_set():
-                        break
-                    events.put(("jar", row))
-                events.put(("done", "Остановлено" if stop.is_set() else "Готово · Y-check"))
+        def on_tick(index, total, jar):
+            if index < 0:
+                events.put(("tick", f"ищу {total}"))
                 return
+            events.put(("tick", f"{index}/{total} {jar.name}"))
 
-            def on_jar(row, n):
-                events.put(("jar", row))
-                if n % 10 == 0:
-                    events.put(("tick", f"Проверено jar: {n}   {row['file']}"))
-
+        def work():
             try:
-                scan(existing, rules, stop, on_jar=on_jar, on_tick=lambda n, p: events.put(("tick", f"Проверено jar: {n}   {p.name}")))
+                found = scan(
+                    existing,
+                    rules,
+                    stop,
+                    on_jar=lambda row, index, total: events.put(("jar", row)),
+                    on_tick=on_tick,
+                )
             except Exception as exc:
                 events.put(("done", f"Ошибка: {exc}"))
                 return
-            events.put(("done", "Остановлено" if stop.is_set() else "Готово"))
+            if stop.is_set():
+                events.put(("done", "Остановлено"))
+            elif not found:
+                events.put(("done", "Jar нет. Обычные файлы пропущены."))
+            else:
+                events.put(("done", "Готово"))
 
         worker["thread"] = threading.Thread(target=work, daemon=True)
         worker["thread"].start()
 
+    def system_dialog(run):
+        root.overrideredirect(False)
+        root.update_idletasks()
+        try:
+            return run()
+        finally:
+            if root.winfo_exists():
+                root.overrideredirect(True)
+                root.after(30, taskbar)
+
     def pick_folder():
         play_tone(640, 28)
-        dialog = tk.Toplevel(root)
-        dialog.title("Куда смотреть")
-        dialog.geometry("760x540")
-        dialog.configure(bg=BG)
-        dialog.transient(root)
-        dialog.grab_set()
-        tk.Label(dialog, text="Папка, диск или программа", bg=BG, fg=TEXT, font=(FONT, 16, "bold")).pack(anchor="w", padx=18, pady=(16, 4))
-        tk.Label(dialog, text="Выбери диск или папку. Для exe/jar нажми «Программа».", bg=BG, fg=MUTED, font=(FONT, 10)).pack(anchor="w", padx=18, pady=(0, 10))
-        listing = tk.Listbox(dialog, bg="#1b1522", fg=TEXT, selectbackground="#5a3d52", relief="flat", highlightthickness=0, font=(FONT, 12), activestyle="none")
-        listing.pack(fill="both", expand=True, padx=18, pady=8)
-        choices = []
-
-        def add(label, path):
-            choices.append(path)
-            listing.insert("end", label)
-
-        add("Загрузки", Path.home() / "Downloads")
-        add("Рабочий стол", Path.home() / "Desktop")
-        add("Документы", Path.home() / "Documents")
-        mc = Path(os.environ.get("APPDATA", "")) / ".minecraft" / "mods"
-        add("Minecraft mods", mc)
-        for drive in pc_roots():
-            add("Диск " + str(drive), drive)
-
-        def use_path(path):
-            dialog.destroy()
+        picked = system_dialog(lambda: filedialog.askdirectory(title="Папка с модами", parent=root))
+        if picked:
             entry.configure(fg=TEXT)
-            path_var.set(str(path))
+            path_var.set(picked)
             play_tone(760, 36)
 
-        def choose(_e=None):
-            if not listing.curselection():
-                return
-            use_path(choices[listing.curselection()[0]])
-
-        def pick_program():
-            dialog.destroy()
-            picked = filedialog.askopenfilename(
-                title="Программа или jar",
+    def pick_file():
+        play_tone(640, 28)
+        picked = system_dialog(
+            lambda: filedialog.askopenfilename(
+                title="Один jar",
                 parent=root,
-                filetypes=[("Программа или мод", "*.exe;*.jar"), ("EXE", "*.exe"), ("JAR", "*.jar")],
+                filetypes=[("JAR", "*.jar"), ("ZIP", "*.zip")],
             )
-            if picked:
-                entry.configure(fg=TEXT)
-                path_var.set(picked)
-                play_tone(760, 36)
-
-        listing.bind("<Double-1>", choose)
-        buttons = tk.Frame(dialog, bg=BG)
-        buttons.pack(fill="x", padx=18, pady=(0, 16))
-        flat_button(buttons, "Открыть", choose)
-        tk.Frame(buttons, width=8, bg=BG).pack(side="left")
-        flat_button(buttons, "Программа", pick_program, fill="#3a3146", fg=TEXT)
-        tk.Frame(buttons, width=8, bg=BG).pack(side="left")
-        flat_button(buttons, "Закрыть", dialog.destroy, fill="#3a3146", fg=TEXT)
+        )
+        if picked:
+            entry.configure(fg=TEXT)
+            path_var.set(picked)
+            play_tone(760, 36)
 
     def scan_path():
-        raw = path_var.get().strip()
-        if not raw or raw == "Path to mods folder...":
-            messagebox.showinfo("CubeHead", "Укажи папку с модами.", parent=root)
+        if worker["thread"] and worker["thread"].is_alive():
+            stop.set()
+            status.configure(text="Останавливаю…")
             return
-        begin([Path(raw)])
+        raw = path_var.get().strip()
+        if not raw or raw == PLACEHOLDER:
+            status.configure(text="Укажи папку с модами или один jar.")
+            return
+        path = Path(raw)
+        if not path.exists():
+            status.configure(text="Такой папки нет.")
+            return
+        if path.is_file() and path.suffix.lower() not in {".jar", ".zip"}:
+            status.configure(text="Это простой файл. Нужен .jar или папка с модами.")
+            return
+        begin([path])
 
     def scan_pc():
         if worker["thread"] and worker["thread"].is_alive():
             stop.set()
+            status.configure(text="Останавливаю…")
             return
-        if ycheck_exe():
-            begin([], pc=True)
-            return
-        begin(pc_roots())
+        begin([], pc=True)
 
     def pump():
         dirty = False
@@ -1873,14 +1979,21 @@ def launch_gui():
                         total = progress_state["total"]
                         progress_label.configure(text=f"{cur}/{total}")
                         progress_caption.configure(text="проверено")
-                        empty.configure(text=f"{cur} / {total}\nпроверено", fg=PINK, font=(FONT, 28, "bold"))
+                        bloom_mode["big"] = True
+                        bloom_mode["line"] = f"{cur} / {total}"
                         if not rows:
-                            empty.place(relx=0.5, rely=0.5, anchor="center")
+                            show_bloom()
                         status.configure(text=name or f"Проверено {cur} из {total}")
                 elif kind == "done":
                     count = progress_label.cget("text")
                     status.configure(text=f"{payload}  {count}".strip())
                     set_busy(False)
+                    if not rows:
+                        bloom_mode["big"] = False
+                        if "Jar нет" in str(payload):
+                            bloom_mode["line"] = "В папке нет jar.\nОбычные файлы пропущены."
+                        else:
+                            bloom_mode["line"] = empty_hint
                     dirty = True
                     if str(payload).startswith("Готово"):
                         play_tone(523, 50)
@@ -1897,10 +2010,11 @@ def launch_gui():
         def on_drop(files):
             for raw in files:
                 path = raw.decode("utf-8", "replace") if isinstance(raw, bytes) else str(raw)
-                if path.lower().endswith(".jar"):
+                if path.lower().endswith((".jar", ".zip")):
                     load_jar_viewer(path)
                     show_page("bytes")
                     break
+                status.configure(text="Это простой файл. В просмотр нужен jar.")
 
         windnd.hook_dropfiles(root, on_drop, force_unicode=True)
     except Exception:
@@ -1915,16 +2029,20 @@ def launch_gui():
 
     if os.environ.get("CH_SHOT"):
         def shot():
+            root.deiconify()
+            root.lift()
+            root.attributes("-topmost", True)
             root.update()
             try:
                 from PIL import ImageGrab
                 x, y = root.winfo_rootx(), root.winfo_rooty()
                 w, h = root.winfo_width(), root.winfo_height()
+                Path(os.environ["CH_SHOT"] + ".txt").write_text(f"{x},{y},{w},{h}", encoding="utf-8")
                 ImageGrab.grab(bbox=(x, y, x + w, y + h)).save(os.environ["CH_SHOT"])
             except Exception as exc:
                 Path(os.environ["CH_SHOT"] + ".err").write_text(str(exc), encoding="utf-8")
             root.destroy()
-        root.after(1400, shot)
+        root.after(1800, shot)
 
     root.mainloop()
 
