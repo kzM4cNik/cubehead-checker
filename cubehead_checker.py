@@ -7,7 +7,9 @@ import math
 import os
 import queue
 import re
+import shutil
 import struct
+import subprocess
 import sys
 import threading
 import urllib.error
@@ -465,53 +467,297 @@ def inspect_any(path, rules):
     return inspect_jar(path, rules)
 
 
-def class_names(path, limit=2500):
-    with zipfile.ZipFile(path) as zf:
-        names = [n for n in zf.namelist() if n.endswith(".class")]
-    return names[:limit]
-
-
 def jar_entries(path):
     with zipfile.ZipFile(path) as zf:
         return [n for n in zf.namelist() if not n.endswith("/")]
 
 
-def class_strings(data, limit=500):
+VINEFLOWER_URL = "https://repo1.maven.org/maven2/org/vineflower/vineflower/1.10.1/vineflower-1.10.1.jar"
+VINEFLOWER_SHA = "b9b208e50793b64657a6b6292067526613f549de7405f9243624b02f4276e409"
+
+VIEW_MARKS = (
+    ("reach", ("getreachdistance", "entity_interaction_range", "longreach", "attackreach", "combatreach")),
+    ("hitbox", ("hitbox", "entitydimensions", "method_5857", "method_5829")),
+    ("trigger", ("triggerbot", "trigger_bot", "autotrigger", "dotrigger")),
+    ("aim", ("aimassist", "aimbot")),
+    ("keepalive", ("keepalive", "handlekeepalive", "onkeepalive")),
+    ("defineClass", ("defineclass", "definehiddenclass")),
+    ("mixin", ("org/spongepowered/asm/mixin", "mixinextras")),
+)
+
+OPNAMES = (
+    "nop aconst_null iconst_m1 iconst_0 iconst_1 iconst_2 iconst_3 iconst_4 iconst_5 lconst_0 lconst_1 "
+    "fconst_0 fconst_1 fconst_2 dconst_0 dconst_1 bipush sipush ldc ldc_w ldc2_w iload lload fload dload aload "
+    "iload_0 iload_1 iload_2 iload_3 lload_0 lload_1 lload_2 lload_3 fload_0 fload_1 fload_2 fload_3 dload_0 "
+    "dload_1 dload_2 dload_3 aload_0 aload_1 aload_2 aload_3 iaload laload faload daload aaload baload caload "
+    "saload istore lstore fstore dstore astore istore_0 istore_1 istore_2 istore_3 lstore_0 lstore_1 lstore_2 "
+    "lstore_3 fstore_0 fstore_1 fstore_2 fstore_3 dstore_0 dstore_1 dstore_2 dstore_3 astore_0 astore_1 astore_2 "
+    "astore_3 iastore lastore fastore dastore aastore bastore castore sastore pop pop2 dup dup_x1 dup_x2 dup2 "
+    "dup2_x1 dup2_x2 swap iadd ladd fadd dadd isub lsub fsub dsub imul lmul fmul dmul idiv ldiv fdiv ddiv irem "
+    "lrem frem drem ineg lneg fneg dneg ishl lshl ishr lshr iushr lushr iand land ior lor ixor lxor iinc i2l "
+    "i2f i2d l2i l2f l2d f2i f2l f2d d2i d2l d2f i2b i2c i2s lcmp fcmpl fcmpg dcmpl dcmpg ifeq ifne iflt ifge "
+    "ifgt ifle if_icmpeq if_icmpne if_icmplt if_icmpge if_icmpgt if_icmple if_acmpeq if_acmpne goto jsr ret "
+    "tableswitch lookupswitch ireturn lreturn freturn dreturn areturn return getstatic putstatic getfield "
+    "putfield invokevirtual invokespecial invokestatic invokeinterface invokedynamic new newarray anewarray "
+    "arraylength athrow checkcast instanceof monitorenter monitorexit wide multianewarray ifnull ifnonnull "
+    "goto_w jsr_w"
+).split()
+
+OPLEN = [1] * 256
+for _op, _ln in (
+    (16, 2), (18, 2), (21, 2), (22, 2), (23, 2), (24, 2), (25, 2), (54, 2), (55, 2), (56, 2), (57, 2), (58, 2),
+    (169, 2), (188, 2), (17, 3), (19, 3), (20, 3), (132, 3), (153, 3), (154, 3), (155, 3), (156, 3), (157, 3),
+    (158, 3), (159, 3), (160, 3), (161, 3), (162, 3), (163, 3), (164, 3), (165, 3), (166, 3), (167, 3), (168, 3),
+    (178, 3), (179, 3), (180, 3), (181, 3), (182, 3), (183, 3), (184, 3), (187, 3), (189, 3), (192, 3), (193, 3),
+    (198, 3), (199, 3), (185, 5), (186, 5), (197, 4), (200, 5), (201, 5),
+):
+    OPLEN[_op] = _ln
+OPLEN[170] = 0
+OPLEN[171] = 0
+OPLEN[196] = 0
+
+
+def _u16(data, i):
+    return int.from_bytes(data[i : i + 2], "big")
+
+
+def _read_pool(data):
     if len(data) < 10 or data[:4] != b"\xca\xfe\xba\xbe":
-        text = data[:4000].decode("utf-8", "replace")
-        return [line for line in text.splitlines() if line.strip()][:limit]
-    count = int.from_bytes(data[8:10], "big")
+        return None
+    count = _u16(data, 8)
+    pool = [None]
     i = 10
-    out = []
     n = 1
     while n < count and i < len(data):
         tag = data[i]
         i += 1
         if tag == 1:
             if i + 2 > len(data):
-                break
-            ln = int.from_bytes(data[i : i + 2], "big")
+                return None
+            ln = _u16(data, i)
             i += 2
-            raw = data[i : i + ln]
+            pool.append(("utf", data[i : i + ln].decode("utf-8", "replace")))
             i += ln
-            text = raw.decode("utf-8", "replace")
-            if text and any(ch.isprintable() for ch in text):
-                out.append(text)
-            if len(out) >= limit:
-                break
         elif tag in (7, 8, 16, 19, 20):
+            if i + 2 > len(data):
+                return None
+            pool.append((tag, _u16(data, i)))
             i += 2
-        elif tag in (3, 4, 9, 10, 11, 12, 17, 18):
-            i += 4
-        elif tag in (5, 6):
-            i += 8
-            n += 1
         elif tag == 15:
+            if i + 3 > len(data):
+                return None
+            pool.append((tag, data[i : i + 3]))
             i += 3
+        elif tag in (5, 6):
+            if i + 8 > len(data):
+                return None
+            pool.append((tag, data[i : i + 8]))
+            i += 8
+            pool.append(None)
+            n += 1
+        elif tag in (3, 4, 9, 10, 11, 12, 17, 18):
+            if i + 4 > len(data):
+                return None
+            pool.append((tag, data[i : i + 4]))
+            i += 4
         else:
-            break
+            return None
         n += 1
-    return out
+    return pool, i
+
+
+def _utf(pool, index):
+    if not index or index >= len(pool):
+        return ""
+    item = pool[index]
+    if isinstance(item, tuple) and item and item[0] == "utf":
+        return item[1]
+    return ""
+
+
+def _class_name(pool, index):
+    if not index or index >= len(pool):
+        return ""
+    item = pool[index]
+    if isinstance(item, tuple) and item[0] == 7:
+        return _utf(pool, item[1])
+    return ""
+
+
+def _member(pool, index):
+    if not index or index >= len(pool):
+        return ""
+    item = pool[index]
+    if not isinstance(item, tuple) or item[0] not in (9, 10, 11) or len(item[1]) != 4:
+        return ""
+    raw = item[1]
+    cls = _class_name(pool, _u16(raw, 0))
+    nat = pool[_u16(raw, 2)] if _u16(raw, 2) < len(pool) else None
+    if not isinstance(nat, tuple) or nat[0] != 12 or len(nat[1]) != 4:
+        return cls
+    name = _utf(pool, _u16(nat[1], 0))
+    desc = _utf(pool, _u16(nat[1], 2))
+    return f"{cls}.{name}:{desc}"
+
+
+def _cp_text(pool, index):
+    if not index or index >= len(pool):
+        return ""
+    item = pool[index]
+    if isinstance(item, tuple) and item[0] == "utf":
+        return item[1]
+    if isinstance(item, tuple) and item[0] == 8:
+        return _utf(pool, item[1])
+    if isinstance(item, tuple) and item[0] == 7:
+        return _class_name(pool, index)
+    member = _member(pool, index)
+    return member
+
+
+def _skip_attrs(data, i):
+    if i + 2 > len(data):
+        return None
+    count = _u16(data, i)
+    i += 2
+    for _ in range(count):
+        if i + 6 > len(data):
+            return None
+        ln = int.from_bytes(data[i + 2 : i + 6], "big")
+        i += 6 + ln
+    return i
+
+
+def _code_attr(pool, data, i):
+    if i + 2 > len(data):
+        return None, i
+    count = _u16(data, i)
+    i += 2
+    code = None
+    for _ in range(count):
+        if i + 6 > len(data):
+            return code, i
+        name = _utf(pool, _u16(data, i))
+        ln = int.from_bytes(data[i + 2 : i + 6], "big")
+        start = i + 6
+        if name == "Code" and start + 8 <= len(data):
+            code_len = int.from_bytes(data[start + 4 : start + 8], "big")
+            code = data[start + 8 : start + 8 + code_len]
+        i = start + ln
+    return code, i
+
+
+def _align4(pos):
+    return (4 - (pos % 4)) % 4
+
+
+def _disassemble(pool, code, limit):
+    lines = []
+    i = 0
+    while i < len(code) and len(lines) < limit:
+        op = code[i]
+        name = OPNAMES[op] if op < len(OPNAMES) else f"op_{op}"
+        if op in (170, 171):
+            lines.append(f"  {name}")
+            pad = _align4(i + 1)
+            cursor = i + 1 + pad
+            if op == 170 and cursor + 12 <= len(code):
+                low = int.from_bytes(code[cursor + 4 : cursor + 8], "big", signed=True)
+                high = int.from_bytes(code[cursor + 8 : cursor + 12], "big", signed=True)
+                cursor += 12 + max(0, high - low + 1) * 4
+            elif op == 171 and cursor + 8 <= len(code):
+                pairs = int.from_bytes(code[cursor + 4 : cursor + 8], "big")
+                cursor += 8 + max(0, pairs) * 8
+            else:
+                break
+            i = cursor
+            continue
+        if op == 196:
+            if i + 1 >= len(code):
+                break
+            wide = code[i + 1]
+            wide_name = OPNAMES[wide] if wide < len(OPNAMES) else str(wide)
+            lines.append(f"  wide {wide_name}")
+            i += 6 if wide == 132 else 4
+            continue
+        step = OPLEN[op]
+        target = ""
+        if op in (18, 19, 20) and i + step <= len(code):
+            index = code[i + 1] if op == 18 else _u16(code, i + 1)
+            target = _cp_text(pool, index)
+        elif op in (178, 179, 180, 181, 182, 183, 184, 185, 187, 192, 193) and i + 3 <= len(code):
+            target = _cp_text(pool, _u16(code, i + 1)) or _member(pool, _u16(code, i + 1))
+        elif op == 186 and i + 3 <= len(code):
+            target = _cp_text(pool, _u16(code, i + 1))
+        if target:
+            shown = target.replace("\n", " ")
+            if len(shown) > 180:
+                shown = shown[:180] + "…"
+            lines.append(f"  {name} {shown}")
+        else:
+            lines.append(f"  {name}")
+        i += step or 1
+    if i < len(code):
+        lines.append("  … дальше обрезано")
+    return lines
+
+
+def class_report(data):
+    parsed = _read_pool(data)
+    if not parsed:
+        text = data[:4000].decode("utf-8", "replace")
+        body = [line for line in text.splitlines() if line.strip()][:80]
+        return ["// Could not parse class file - showing raw strings", *body]
+    pool, i = parsed
+    if i + 6 > len(data):
+        return ["// Could not parse class file - showing raw strings"]
+    this = _class_name(pool, _u16(data, i + 2))
+    super_name = _class_name(pool, _u16(data, i + 4))
+    i += 6
+    if i + 2 > len(data):
+        return ["// Could not parse class file - showing raw strings"]
+    iface_count = _u16(data, i)
+    i += 2 + iface_count * 2
+    i = _skip_attrs_fields(pool, data, i)
+    if i is None:
+        return [f"class {this}", f"super {super_name}", "// дальше класс не разобрался"]
+    strings = [item[1] for item in pool if isinstance(item, tuple) and item[0] == "utf"]
+    blob = "\n".join(strings).lower()
+    marks = [label for label, words in VIEW_MARKS if any(word in blob for word in words)]
+    lines = [f"class {this or '?'}", f"super {super_name or '?'}"]
+    if marks:
+        lines.append("отметки: " + ", ".join(marks))
+    lines.append("")
+    method_count = _u16(data, i) if i + 2 <= len(data) else 0
+    i += 2
+    shown = 0
+    for _ in range(method_count):
+        if i + 6 > len(data) or shown >= 40:
+            break
+        name = _utf(pool, _u16(data, i + 2))
+        desc = _utf(pool, _u16(data, i + 4))
+        code, i = _code_attr(pool, data, i + 6)
+        lines.append(f"method {name}{desc}")
+        if code:
+            lines.extend(_disassemble(pool, code, 80))
+        lines.append("")
+        shown += 1
+    if method_count > shown:
+        lines.append(f"… ещё методов: {method_count - shown}")
+    return lines
+
+
+def _skip_attrs_fields(pool, data, i):
+    if i + 2 > len(data):
+        return None
+    fields = _u16(data, i)
+    i += 2
+    for _ in range(fields):
+        if i + 6 > len(data):
+            return None
+        i = _skip_attrs(data, i + 6)
+        if i is None:
+            return None
+    return i
 
 
 def entry_preview(path, name):
@@ -521,8 +767,84 @@ def entry_preview(path, name):
             return ["Файл больше 1.5 МБ, показаны только имя и размер.", name, str(info.file_size)]
         raw = zf.read(name)
     if name.endswith(".class"):
-        return class_strings(raw)
-    return raw[:12000].decode("utf-8", "replace").splitlines()
+        return class_report(raw)
+    if name.endswith((".json", ".toml", ".txt", ".xml", ".properties", ".mcmeta", ".cfg", ".lang")):
+        return raw[:12000].decode("utf-8", "replace").splitlines()
+    return [f"Бинарный файл, {info.file_size} байт.", "Для класса открой .class — будет декомпиляция или байткод."]
+
+
+def _vineflower_path():
+    folder = _modrinth_cache_path().parent
+    folder.mkdir(parents=True, exist_ok=True)
+    path = folder / "vineflower-1.10.1.jar"
+    if path.exists():
+        digest = hashlib.sha256(path.read_bytes()).hexdigest()
+        if digest == VINEFLOWER_SHA:
+            return path
+        try:
+            path.unlink()
+        except OSError:
+            return None
+    try:
+        req = urllib.request.Request(VINEFLOWER_URL, headers={"User-Agent": "CubeHeadChecker/1.1"})
+        with urllib.request.urlopen(req, timeout=40) as resp:
+            data = resp.read()
+    except Exception:
+        return None
+    if hashlib.sha256(data).hexdigest() != VINEFLOWER_SHA or not data.startswith(b"PK"):
+        return None
+    path.write_bytes(data)
+    return path
+
+
+def _java_map(dest):
+    found = {}
+    if not dest.exists():
+        return found
+    for java in dest.rglob("*.java"):
+        rel = java.relative_to(dest).as_posix()
+        try:
+            text = java.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        if len(text) > 200000:
+            text = text[:200000] + "\n…"
+        found[rel[:-5] + ".class"] = text
+    return found
+
+
+def decompile_jar(path):
+    java = shutil.which("java")
+    if not java:
+        return {}
+    try:
+        sha = _file_sha1(path)
+    except OSError:
+        return {}
+    dest = _modrinth_cache_path().parent / "decompiled" / sha
+    marker = dest / ".done"
+    if marker.exists():
+        return _java_map(dest)
+    tool = _vineflower_path()
+    if tool is None:
+        return {}
+    dest.mkdir(parents=True, exist_ok=True)
+    try:
+        done = subprocess.run(
+            [java, "-jar", str(tool), str(path), str(dest)],
+            capture_output=True,
+            timeout=120,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+    except Exception:
+        return {}
+    if done.returncode != 0 and not any(dest.rglob("*.java")):
+        return {}
+    try:
+        marker.write_text("ok", encoding="utf-8")
+    except OSError:
+        pass
+    return _java_map(dest)
 
 
 def loaded_log_text():
@@ -1620,8 +1942,8 @@ def launch_gui():
             )
         )
         if picked:
+            selected["path"] = picked
             show_page("bytes")
-            load_jar_viewer(picked)
 
     flat_button(byte_bar, "Open JAR", open_jar_dialog, fill=SOFT, fg=TEXT)
     tk.Label(byte_bar, textvariable=byte_file, bg=BG, fg=MUTED, font=(FONT, 10)).pack(side="left", padx=10)
@@ -1656,32 +1978,53 @@ def launch_gui():
     byte_text.pack(fill="both", expand=True, padx=10, pady=(0, 10))
     byte_text.configure(state="disabled")
     viewer_entries = []
+    viewer_sources = {}
+    viewer_job = {"id": 0, "pending": False}
 
     def load_jar_viewer(path):
         selected["path"] = path
+        viewer_sources.clear()
+        viewer_job["id"] += 1
+        viewer_job["pending"] = False
+        token = viewer_job["id"]
         byte_file.set(Path(path).name)
         drop_hint.place_forget()
         file_tree.delete(0, "end")
         viewer_entries.clear()
         if not str(path).lower().endswith((".jar", ".zip")):
             set_text(byte_text, "Это простой файл.\nПросмотр открывает только .jar")
-            view_title.configure(text="Viewer")
+            view_title.configure(text="Bytecode Viewer")
             return
         try:
             names = jar_entries(path)
         except zipfile.BadZipFile:
             set_text(byte_text, "Файл не открылся как jar.\nПохоже на простой или битый файл.")
-            view_title.configure(text="Viewer")
+            view_title.configure(text="Bytecode Viewer")
             return
         except Exception:
             set_text(byte_text, "Файл не открылся.\nНужен обычный .jar")
-            view_title.configure(text="Viewer")
+            view_title.configure(text="Bytecode Viewer")
             return
+        classes = 0
         for name in names:
             viewer_entries.append(name)
             file_tree.insert("end", name)
-        view_title.configure(text="Viewer    Select a file in the tree")
-        set_text(byte_text, "")
+            if name.endswith(".class"):
+                classes += 1
+        byte_file.set(f"{Path(path).name}  ·  {classes} classes")
+        view_title.configure(text="Bytecode Viewer    выбери класс")
+        set_text(byte_text, "Выбери .class слева.\nСначала покажется байткод, потом декомпиляция, если Java успеет.")
+        if classes:
+            viewer_job["pending"] = True
+
+            def work(job=token, jar=path):
+                try:
+                    sources = decompile_jar(jar) or {}
+                except Exception:
+                    sources = {}
+                events.put(("decompiled", (job, jar, sources)))
+
+            threading.Thread(target=work, daemon=True).start()
         play_tone(540, 30)
         root.after(70, lambda: play_tone(760, 40))
 
@@ -1689,12 +2032,20 @@ def launch_gui():
         if not file_tree.curselection() or not selected["path"]:
             return
         name = viewer_entries[file_tree.curselection()[0]]
-        view_title.configure(text="Viewer    " + name)
+        source = viewer_sources.get(name)
+        if source:
+            view_title.configure(text="Decompiled    " + name)
+            set_text(byte_text, "Decompiled: " + name + "\n\n" + source)
+            play_tone(880, 24)
+            return
+        view_title.configure(text="Bytecode    " + name)
         try:
             lines = entry_preview(selected["path"], name)
-        except Exception as exc:
-            set_text(byte_text, str(exc))
+        except Exception:
+            set_text(byte_text, "// Could not parse class file - showing raw strings")
             return
+        if name.endswith(".class") and viewer_job["pending"]:
+            lines = ["Декомпилятор ещё считает. Пока байткод.", ""] + lines
         set_text(byte_text, "\n".join(lines) if lines else "Пусто")
         play_tone(880, 24)
 
@@ -1828,6 +2179,10 @@ def launch_gui():
     def on_result_double(_event):
         path = selected["path"]
         target = Path(path) if path else None
+        if target and target.is_file() and target.suffix.lower() in {".jar", ".zip"}:
+            selected["path"] = str(target)
+            show_page("bytes")
+            return
         if target and target.exists():
             os.startfile(target if target.is_dir() else target.parent)
         elif target and target.parent.exists():
@@ -1984,6 +2339,16 @@ def launch_gui():
                         if not rows:
                             show_bloom()
                         status.configure(text=name or f"Проверено {cur} из {total}")
+                elif kind == "decompiled":
+                    token, jar, sources = payload
+                    if token == viewer_job["id"] and jar == selected["path"]:
+                        viewer_sources.clear()
+                        viewer_sources.update(sources or {})
+                        viewer_job["pending"] = False
+                        if file_tree.curselection():
+                            on_tree_select()
+                        elif sources:
+                            view_title.configure(text="Bytecode Viewer    декомпиляция готова")
                 elif kind == "done":
                     count = progress_label.cget("text")
                     status.configure(text=f"{payload}  {count}".strip())
